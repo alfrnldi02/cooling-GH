@@ -1,0 +1,270 @@
+import serial
+import RPi.GPIO as GPIO
+import time
+import re
+import threading
+from datetime import datetime
+import paho.mqtt.client as mqtt
+import json
+import logging
+import os
+
+# === Konfigurasi Logging ===
+logging.basicConfig(filename='/home/rapi1/project_saya/log/iot_log.log', level=logging.INFO,
+                    format='%(asctime)s %(levelname)s: %(message)s')
+
+# === Konfigurasi ===
+CONFIG = {
+    "MQTT_BROKER": "iterahero.com",
+    "MQTT_PORT": 1883,
+    "TOPIK_SUHU": "iterahero/kebun-raya-itera/sensor/sensor-ts3b/data",
+    "TOPIK_KELEMBAPAN": "iterahero/kebun-raya-itera/sensor/sensor-hcxh/data",
+    "TOPIK_STATUS": "iterahero/kebun-raya-itera/actuator/actuator-pzqi/cmd",
+    "DE_PIN": 23,
+    "RE_PIN": 24,
+    "RELAY_PINS": [26, 16, 12, 25],
+    "SUHU_THRESHOLD_ON": 35,
+    "SUHU_THRESHOLD_OFF": 29,
+    "HUMIDITY_THRESHOLD_ON": 65,
+    "HUMIDITY_THRESHOLD_OFF": 75,
+    "POMPA_HUMIDITY_ON": 65,
+    "POMPA_HUMIDITY_OFF": 75,
+    "KIPAS2_DELAY": 15
+}
+
+# === Variabel Global ===
+MQTT_BROKER = CONFIG["MQTT_BROKER"]
+MQTT_PORT = CONFIG["MQTT_PORT"]
+TOPIK_SUHU = CONFIG["TOPIK_SUHU"]
+TOPIK_KELEMBAPAN = CONFIG["TOPIK_KELEMBAPAN"]
+TOPIK_STATUS = CONFIG["TOPIK_STATUS"]
+DE_PIN = CONFIG["DE_PIN"]
+RE_PIN = CONFIG["RE_PIN"]
+RELAY_PINS = CONFIG["RELAY_PINS"]
+SUHU_THRESHOLD_ON = CONFIG["SUHU_THRESHOLD_ON"]
+SUHU_THRESHOLD_OFF = CONFIG["SUHU_THRESHOLD_OFF"]
+HUMIDITY_THRESHOLD_ON = CONFIG["HUMIDITY_THRESHOLD_ON"]
+HUMIDITY_THRESHOLD_OFF = CONFIG["HUMIDITY_THRESHOLD_OFF"]
+POMPA_HUMIDITY_ON = CONFIG["POMPA_HUMIDITY_ON"]
+POMPA_HUMIDITY_OFF = CONFIG["POMPA_HUMIDITY_OFF"]
+KIPAS2_DELAY = CONFIG["KIPAS2_DELAY"]
+
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(DE_PIN, GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(RE_PIN, GPIO.OUT, initial=GPIO.LOW)
+for pin in RELAY_PINS:
+    GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+
+try:
+    ser = serial.Serial('/dev/serial0', baudrate=9600, timeout=2)
+except serial.SerialException as e:
+    logging.error(f"Error membuka serial port: {e}")
+    ser = None
+
+status_relay = "OFF"
+kipas_aktif = False
+pompa_aktif = False
+kipas1_start_time = None
+kipas2_aktif = False
+kipas2_timer = None
+kosong_counter = 0
+latest_suhu = None
+latest_humid = None
+
+# === Inisialisasi MQTT Client dengan Callback API v2 ===
+client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+
+# === Callback MQTT ===
+# --- BAGIAN YANG DIPERBAIKI ---
+def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+    """
+    Callback untuk menangani koneksi yang terputus.
+    Signature fungsi ini (5 argumen) sudah sesuai dengan CallbackAPIVersion.VERSION2.
+    """
+    logging.warning(f"MQTT disconnected, reason: {reason_code}")
+    while not client.is_connected():
+        try:
+            logging.info("Attempting to reconnect to MQTT...")
+            client.reconnect()
+            logging.info("Reconnected to MQTT")
+        except Exception as err:
+            logging.error(f"Reconnect failed: {err}, retrying in 5s")
+            time.sleep(5)
+
+def on_message(client, userdata, msg):
+    global status_relay, kipas_aktif, pompa_aktif, kipas1_start_time, kipas2_aktif, kipas2_timer
+    global latest_suhu, latest_humid
+
+    payload = msg.payload.decode().strip().upper()
+    logging.info(f"Pesan dari {msg.topic}: {payload}")
+
+    if msg.topic == TOPIK_STATUS and payload in ["ON", "OFF"]:
+        status_relay = payload
+        logging.info(f"Status relay diperbarui: {status_relay}")
+
+        if status_relay == "OFF":
+            if kipas2_timer and kipas2_timer.is_alive():
+                kipas2_timer.cancel()
+                logging.info("Timer kipas 2 dibatalkan karena status OFF")
+            for pin in RELAY_PINS:
+                GPIO.output(pin, GPIO.LOW)
+            kipas_aktif = False
+            pompa_aktif = False
+            kipas1_start_time = None
+            kipas2_aktif = False
+            logging.info("Semua relay dimatikan (perintah OFF)")
+
+        elif status_relay == "ON":
+            if latest_suhu is not None and latest_humid is not None:
+                now = time.time()
+                kontrol_kipas(latest_suhu, latest_humid, now)
+                logging.info("Perintah ON diproses berdasarkan data sensor terbaru")
+            else:
+                logging.warning("Data suhu/kelembapan belum tersedia. Kipas tidak diaktifkan.")
+
+client.on_message = on_message
+client.on_disconnect = on_disconnect
+client.connect(MQTT_BROKER, MQTT_PORT, 30)
+client.subscribe(TOPIK_STATUS, qos=1)
+client.loop_start()
+
+def aktifkan_kipas_kedua():
+    kipas2_pin = CONFIG["RELAY_PINS"][1]
+    global kipas2_aktif
+    if GPIO.input(kipas2_pin) == GPIO.LOW:
+        GPIO.output(kipas2_pin, GPIO.HIGH)
+        kipas2_aktif = True
+        logging.info("Kipas 2 AKTIF (manual delay 15 detik)")
+
+def toggle_re_pin():
+    while True:
+        GPIO.output(RE_PIN, GPIO.HIGH)
+        time.sleep(1)
+        GPIO.output(RE_PIN, GPIO.LOW)
+        time.sleep(1)
+
+threading.Thread(target=toggle_re_pin, daemon=True).start()
+
+def send_cmd(cmd: bytes):
+    if ser is None:
+        return
+    GPIO.output(DE_PIN, GPIO.HIGH)
+    time.sleep(0.01)
+    ser.write(cmd)
+    ser.flush()
+    time.sleep(0.05)
+    GPIO.output(DE_PIN, GPIO.LOW)
+    time.sleep(0.01)
+
+def kontrol_kipas(suhu_final, humiditi_final, now):
+    global kipas_aktif, kipas2_aktif, kipas1_start_time, kipas2_timer
+    kipas1_pin = CONFIG["RELAY_PINS"][0]
+    kipas2_pin = CONFIG["RELAY_PINS"][1]
+
+    if not kipas_aktif and (suhu_final > SUHU_THRESHOLD_ON or humiditi_final < HUMIDITY_THRESHOLD_ON):
+        if GPIO.input(kipas1_pin) == GPIO.LOW:
+            GPIO.output(kipas1_pin, GPIO.HIGH)
+            kipas_aktif = True
+            kipas1_start_time = now
+            kipas2_aktif = False
+            logging.info("Kipas 1 AKTIF (otomatis)")
+            if kipas2_timer and kipas2_timer.is_alive():
+                kipas2_timer.cancel()
+            kipas2_timer = threading.Timer(KIPAS2_DELAY, aktifkan_kipas_kedua)
+            kipas2_timer.start()
+
+    if kipas_aktif and not kipas2_aktif and kipas1_start_time and (now - kipas1_start_time) >= KIPAS2_DELAY:
+        if GPIO.input(kipas2_pin) == GPIO.LOW:
+            GPIO.output(kipas2_pin, GPIO.HIGH)
+            kipas2_aktif = True
+            logging.info(f"Kipas 2 AKTIF setelah {KIPAS2_DELAY}s (otomatis)")
+
+    if kipas_aktif and (suhu_final < SUHU_THRESHOLD_OFF and humiditi_final > HUMIDITY_THRESHOLD_OFF):
+        if GPIO.input(kipas1_pin) == GPIO.HIGH:
+            GPIO.output(kipas1_pin, GPIO.LOW)
+        if GPIO.input(kipas2_pin) == GPIO.HIGH:
+            GPIO.output(kipas2_pin, GPIO.LOW)
+        kipas_aktif = False
+        kipas2_aktif = False
+        kipas1_start_time = None
+        logging.info("Kipas NONAKTIF")
+
+def kontrol_pompa(humiditi_final):
+    global pompa_aktif
+    pompa_pin1 = CONFIG["RELAY_PINS"][2]
+    pompa_pin2 = CONFIG["RELAY_PINS"][3]
+
+    if not pompa_aktif and humiditi_final < POMPA_HUMIDITY_ON:
+        if GPIO.input(pompa_pin1) == GPIO.LOW and GPIO.input(pompa_pin2) == GPIO.LOW:
+            GPIO.output(pompa_pin1, GPIO.HIGH)
+            GPIO.output(pompa_pin2, GPIO.HIGH)
+            pompa_aktif = True
+            logging.info("Pompa AKTIF")
+    elif pompa_aktif and humiditi_final > POMPA_HUMIDITY_OFF:
+        if GPIO.input(pompa_pin1) == GPIO.HIGH and GPIO.input(pompa_pin2) == GPIO.HIGH:
+            GPIO.output(pompa_pin1, GPIO.LOW)
+            GPIO.output(pompa_pin2, GPIO.LOW)
+            pompa_aktif = False
+            logging.info("Pompa NONAKTIF")
+
+if __name__ == '__main__':
+    try:
+        logging.info("Mengirim AUTO untuk continuous output...")
+        send_cmd(b'AUTO\r\n')
+        time.sleep(0.1)
+
+        while True:
+            if ser is None:
+                logging.warning("Serial tidak tersedia, retry dalam 5s")
+                time.sleep(5)
+                continue
+
+            try:
+                line = ser.readline().decode('ascii', errors='ignore').strip()
+            except serial.SerialException as e:
+                logging.error(f"Error baca serial: {e}")
+                time.sleep(2)
+                continue
+
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            if not line:
+                kosong_counter += 1
+                logging.warning(f"{current_time} - kosong (counter: {kosong_counter})")
+                if kosong_counter >= 30:
+                    logging.error("30x data kosong, restart program paksa")
+                    os._exit(1)
+            else:
+                kosong_counter = 0
+                logging.info(f"Raw: {line}")
+                nums = re.findall(r'\d+\.\d+', line)
+                if len(nums) >= 2:
+                    t, h = map(float, nums[:2])
+                    suhu_final = (0.89606 * t) + 3.37342
+                    humiditi_final = -14.92684 + (1.1017 * h)
+                    latest_suhu = suhu_final
+                    latest_humid = humiditi_final
+                    logging.info(f"{current_time} | Suhu: {suhu_final:.2f} C | RH: {humiditi_final:.2f} %")
+                    client.publish(TOPIK_SUHU, round(suhu_final, 2))
+                    client.publish(TOPIK_KELEMBAPAN, round(humiditi_final, 2))
+
+                    now = time.time()
+                    if status_relay == "ON":
+                        kontrol_kipas(suhu_final, humiditi_final, now)
+                        kontrol_pompa(humiditi_final)
+
+            if client.is_connected():
+                logging.info("MQTT status: CONNECTED")
+            else:
+                logging.warning("MQTT status: DISCONNECTED")
+            time.sleep(1)
+
+    finally:
+        send_cmd(b'STOP\r\n')
+        if ser:
+            ser.close()
+        GPIO.cleanup()
+        client.loop_stop()
+        client.disconnect()
+        logging.info("Program dihentikan dengan aman")
